@@ -382,12 +382,18 @@ def safe_fill(loc, val, timeout=6000):
 
 def launch_browser(p):
     kw = {"headless": HEADLESS}
+    chans = ["msedge", "chrome"] if sys.platform.startswith("win") else ["chrome", "msedge"]
     try:
         if EDGE_PATH:
             return p.chromium.launch(executable_path=EDGE_PATH, **kw)
-        return p.chromium.launch(channel="msedge", **kw)
     except Exception:
-        return p.chromium.launch(**kw)  # falls back to Playwright's bundled Chromium / Chrome
+        pass
+    for ch in chans:
+        try:
+            return p.chromium.launch(channel=ch, **kw)
+        except Exception:
+            continue
+    return p.chromium.launch(**kw)  # falls back to Playwright's bundled Chromium
 
 
 def new_page(browser, c, on_stage=None):
@@ -1270,6 +1276,10 @@ def main():
     print(f"Password Reset worker {WORKER_ID} -> {GAS_URL[:60]}...  (demo={DEMO_MODE}, headless={HEADLESS}, slots={MAX_BROWSERS})")
     try:
         API.call("ping")
+        try:
+            API.call("diag", msg="Worker started on the runner - looking for the run")
+        except Exception:
+            pass
         print("Connected to the portal - the portal now shows 'Worker online'. Keep this window open.")
     except Exception as e:
         sys.exit(f"Cannot reach the portal: {e}\nCheck GAS_URL (must end in /exec) and WORKER_TOKEN (copy it again from the setup log).")
@@ -1282,6 +1292,10 @@ def main():
             log(f"job {job['id'][:8]} finished")
         except Exception as e:
             log(f"job {job['id'][:8]} crashed: {e}")
+            try:
+                API.call("diag", id=job["id"], msg="Worker crashed: " + str(e)[:200])
+            except Exception:
+                pass
         finally:
             slots.release()
 

@@ -1,5 +1,5 @@
 {
-  "_version": 5,
+  "_version": 6,
   "nav_timeout_ms": 60000,
   "step_timeout_ms": 20000,
   "outcome_timeout_s": 20,
@@ -17,7 +17,7 @@
   "failure_regex": "invalid|incorrect|failed|not match|cannot|can't|already used|previous password|policy|error|must contain|at least",
   "confirm_btn": "button:has-text('Yes'), button:has-text('OK'), button:has-text('Confirm')",
   "logout_btn": "text=/log ?out|sign ?out/i",
-  "l2_menu": "Password Reset",
+  "l2_menu": "Reset Password",
   "l2_radio_locked": "Locked Users",
   "l2_radio_all": "All Users",
   "l2_username_header": "Username",

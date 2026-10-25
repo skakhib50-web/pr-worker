@@ -285,6 +285,7 @@ class Tracker:
 
     def __init__(self, job_id):
         self.id, self.stage_code, self.current, self.idx = job_id, "login", "", 0
+        self.ustart = time.time()
         self.events, self._sent, self._last, self._dirty = [], 0, None, True
         self._lock, self._stop = threading.Lock(), threading.Event()
         self._t = threading.Thread(target=self._pump, daemon=True)
@@ -310,6 +311,7 @@ class Tracker:
 
     def user(self, uid, idx):
         self.current, self.idx, self._dirty = uid, idx, True
+        self.ustart = time.time()
 
     def push(self):
         with self._lock:
@@ -617,43 +619,49 @@ def _type_slow(loc, text):
         loc.type(text, delay=40)
 
 
-def open_menu(page, c, text):
-    """Menu Search box -> type the menu name -> click the autocomplete entry."""
+def open_menu(page, c, text, rx=None):
+    """Menu Search box -> type the menu name -> click the autocomplete entry (prefers 'Menu : ...' over 'Route : ...')."""
     step(page, "menu search: " + text)
     ensure_ready(page, c)
     s = page.locator("#MenuSearchBox")
     if s.count() == 0:
         s = vis(page, c["menu_search"])
     s = s.first
-    s.wait_for(state="visible")
+    s.wait_for(state="visible", timeout=30000)
     try:
         s.click(timeout=4000)
     except Exception:
         s.focus()
     s.fill("")
     _type_slow(s, text)
-    time.sleep(1.0)
-    menu_rx = r"Menu\s*:\s*" + re.escape(text)
-    end = time.time() + 10
+    time.sleep(1.2)
+    want = re.compile(rx or re.escape(text), re.I)
+    end = time.time() + 12
     while time.time() < end:
         items = page.locator("ul.ui-autocomplete li >> visible=true")
         if items.count() > 0:
-            match = items.filter(has_text=re.compile(re.escape(text), re.I))
-            tgt = match.first if match.count() > 0 else items.first
+            match = items.filter(has_text=want)
+            if match.count() == 0:
+                time.sleep(0.4)
+                if time.time() < end - 1:
+                    continue
+            menu_only = match.filter(has_text=re.compile(r"^\s*Menu\s*:", re.I))
+            tgt = (menu_only.first if menu_only.count() > 0 else (match.first if match.count() > 0 else items.first))
             try:
                 tgt.locator("a").last.click(timeout=3000)
             except Exception:
                 tgt.evaluate("e => e.click()")
-            return
-        el = visible_text_el(page, menu_rx)
+            return True
+        el = visible_text_el(page, r"Menu\s*:\s*(" + (rx or re.escape(text)) + ")")
         if el is not None:
             try:
                 el.click(timeout=3000)
             except Exception:
                 el.evaluate("e => e.click()")
-            return
+            return True
         time.sleep(0.3)
     s.press("Enter")
+    return False
 
 
 def open_change_password(page, c, uid=""):
@@ -845,8 +853,20 @@ def user_reset_one(browser, url, uid, old, new, on_stage=None):
 # =====================================================================================================
 # Workflow 1 - L2-Sites login reset (unlock / reset)
 # =====================================================================================================
+L2_MENU_RX = r"reset\s*password|password\s*reset"
+
+
+def _l2_terms(c):
+    t = [c.get("l2_menu") or "Reset Password", "Reset Password", "Password Reset", "reset"]
+    out = []
+    for x in t:
+        if x and x not in out:
+            out.append(x)
+    return out
+
+
 def l2_find_frame(page, c, timeout=40):
-    rx = re.compile(r"^\s*" + re.escape(c["l2_radio_all"]) + r"\s*$", re.I)
+    rx = re.compile(r"^\s*(" + re.escape(c["l2_radio_all"]) + "|" + re.escape(c["l2_radio_locked"]) + r")\s*$", re.I)
     end = time.time() + timeout
     while time.time() < end:
         for fr in list(page.frames):
@@ -861,14 +881,21 @@ def l2_find_frame(page, c, timeout=40):
 
 
 def l2_open_screen(page, c):
-    try:
-        open_menu(page, c, c["l2_menu"])
-        step(page, "wait for the Password Reset screen")
-        return l2_find_frame(page, c, timeout=15)
-    except StepError:
-        pass
-    step(page, "fallback: left menu User Management > " + c["l2_menu"])
-    exact = r"^\s*" + re.escape(c["l2_menu"]) + r"\s*$"
+    for term in _l2_terms(c):
+        try:
+            open_menu(page, c, term, L2_MENU_RX if term.lower() != "reset" else None)
+            step(page, "wait for the Reset Password screen")
+            try:
+                ensure_ready(page, c)
+            except Exception:
+                pass
+            return l2_find_frame(page, c, timeout=25)
+        except StepError:
+            log("menu search '" + term + "' did not open the screen - trying the next spelling")
+        except Exception as e:
+            log("menu search '" + term + "' failed: " + str(e)[:120])
+    step(page, "fallback: left menu User Management > Reset Password")
+    exact = r"^\s*(" + L2_MENU_RX + r")\s*$"
     el = visible_text_el(page, exact)
     if el is None:
         grp = visible_text_el(page, r"^\s*User Management\s*$")
@@ -877,14 +904,14 @@ def l2_open_screen(page, c):
                 grp.click(timeout=3000)
             except Exception:
                 grp.evaluate("e => e.click()")
-        time.sleep(1.0)
+        time.sleep(1.5)
         el = visible_text_el(page, exact)
     if el is not None:
         try:
             el.click(timeout=3000)
         except Exception:
             el.evaluate("e => e.click()")
-    return l2_find_frame(page, c, timeout=25)
+    return l2_find_frame(page, c, timeout=40)
 
 
 def l2_select_radio(fr, label):
@@ -1000,6 +1027,13 @@ def _l2_action(page, c, uid, label_key, radio_key, wait_msg):
     return base_ok, base_bad, dstart
 
 
+INSTANCE = [""]
+
+
+def _in_inst():
+    return f" in instance ({INSTANCE[0]})" if INSTANCE[0] else ""
+
+
 def l2_unlock(page, c, uid, required=True):
     """True = unlocked, False = user was not locked (only allowed when `required` is False)."""
     stage(page, "unlock")
@@ -1011,11 +1045,11 @@ def l2_unlock(page, c, uid, required=True):
                                      attempts=3 if required else 2, wait=10 if required else 6, stop_after_empty=2 if required else 1)
     if not found:
         if not required:
-            log(uid + ": not in the Locked Users list - unlock skipped")
+            log(f"{uid}: not locked{_in_inst()} - unlock skipped")
             return False
         if n:
             raise StepError(f"'{c['l2_unlock_link']}' link not found in the row of {uid} ({diag})")
-        raise StepError(f"User ID {uid} is not in the Locked Users list - the account is not locked, or the ID is wrong ({diag})")
+        raise StepError(f"User ID {uid} is not locked{_in_inst()} (not in the Locked Users list)")
     base_ok, base_bad, dstart = _l2_action(page, c, uid, None, None, None)
     step(page, f"click '{c['l2_unlock_link']}' for {uid}")
     l2_click_action(fr)
@@ -1043,7 +1077,7 @@ def l2_reset(page, c, uid):
     if not found:
         if n:
             raise StepError(f"'{c['l2_reset_link']}' link not found in the row of {uid} ({diag})")
-        raise StepError(f"User ID {uid} was not found in the All Users list ({diag})")
+        raise StepError(f"User ID {uid} was not found{_in_inst()} in the All Users list")
     base_ok, base_bad, dstart = _l2_action(page, c, uid, None, None, None)
     step(page, f"click '{c['l2_reset_link']}' for {uid}")
     l2_click_action(fr)
@@ -1061,7 +1095,7 @@ def l2_do_user(page, c, uid, action):
     msgs = []
     if action in ("unlock", "both"):
         done = l2_unlock(page, c, uid, required=(action == "unlock"))
-        msgs.append(f"Successfully unlocked user ID {uid}" if done else f"User ID {uid} was not locked - unlock skipped")
+        msgs.append(f"Successfully unlocked user ID {uid}" if done else f"User ID {uid} is not locked{_in_inst()} - unlock skipped")
     if action in ("reset", "both"):
         l2_reset(page, c, uid)
         msgs.append("Password reset done.")
@@ -1187,10 +1221,15 @@ def run_job(job):
     done = set()
 
     def finish_once(uid, r):
+        try:
+            r["secs"] = round(time.time() - tr.ustart, 1)
+        except Exception:
+            pass
         done.add(uid)
         finish(uid, r)
 
     try:
+        INSTANCE[0] = job.get("inst") or ""
         if kind == "l2":
             run_l2_batch(job["url"], ids, job["action"], job["l2_user"], job["l2_pw"], tr, finish_once)
         else:  # report login reset

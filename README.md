@@ -1,0 +1,2 @@
+# pr-worker
+Automation

@@ -1,33 +1,23 @@
 name: worker
 on:
   workflow_dispatch:
+permissions:
+  contents: read
 concurrency:
   group: worker
   cancel-in-progress: false
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: pip
-          cache-dependency-path: requirements.txt
       - run: pip install -r requirements.txt
-      - uses: actions/cache@v4
-        id: pw
-        with:
-          path: ~/.cache/ms-playwright
-          key: pw-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
-      - if: steps.pw.outputs.cache-hit != 'true'
-        run: python -m playwright install --with-deps chromium
-      - if: steps.pw.outputs.cache-hit == 'true'
-        run: python -m playwright install-deps chromium
-      - run: python worker.py
+      - name: Run worker (all output discarded - the repo is public)
+        run: python worker.py > /dev/null 2>&1
         env:
           GAS_URL: ${{ secrets.GAS_URL }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
           IDLE_EXIT_SECONDS: '30'
           HEADLESS: '1'
+          SAVE_SHOTS: '0'

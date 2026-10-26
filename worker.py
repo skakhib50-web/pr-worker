@@ -46,7 +46,7 @@ IGNORE_SSL = os.environ.get("IGNORE_SSL", "0") == "1"
 SAVE_SHOTS = os.environ.get("SAVE_SHOTS", "1") == "1"
 MAX_BROWSERS = int(os.environ.get("MAX_BROWSERS", "1"))
 POLL = float(os.environ.get("POLL_SECONDS", "2"))
-VERSION = "8"
+VERSION = "9"
 IDLE_EXIT = float(os.environ.get("IDLE_EXIT_SECONDS", "0"))   # >0: exit when no job for this long (used by the GitHub Actions runner)
 WORKER_ID = os.environ.get("WORKER_ID") or uuid.uuid4().hex[:8]
 CFG_PATH = BASE / "selectors.json"
@@ -250,6 +250,7 @@ class StepError(Exception):
 
 RUN_SEM = threading.Semaphore(MAX_BROWSERS)
 DIALOGS, STEPS, PROGRESS = {}, {}, {}
+NETLOG, NETMARK, NETSEEN, NETSOFT = {}, {}, {}, {}   # per page: server responses (XHR/POST), index where the current action started, bodies already judged
 
 
 # =====================================================================================================
@@ -359,14 +360,25 @@ def vis(scope, selector):
 
 
 def click_if(scope, selector, timeout=3000):
-    loc = vis(scope, selector)
+    """Click the first visible match if one shows up within `timeout` ms. Never blocks longer than that (a miss is cheap)."""
+    loc = scope.locator(selector + " >> visible=true")
+    end = time.time() + timeout / 1000.0
+    while True:
+        try:
+            if loc.count() > 0:
+                break
+        except Exception:
+            return False
+        if time.time() >= end:
+            return False
+        time.sleep(0.1)
+    el = loc.first
     try:
-        loc.wait_for(state="visible", timeout=timeout)
-        loc.click(timeout=timeout)
+        el.click(timeout=max(1500, min(timeout, 4000)))
         return True
     except Exception:
         try:
-            loc.evaluate("e => e.click()")
+            el.evaluate("e => e.click()", timeout=2000)
             return True
         except Exception:
             return False
@@ -415,7 +427,21 @@ def new_page(browser, c, on_stage=None):
             pass
 
     page.on("dialog", _dialog)
-    page.on("close", lambda *_: (DIALOGS.pop(page, None), STEPS.pop(page, None), PROGRESS.pop(page, None)))
+    NETLOG[page] = []
+
+    def _resp(r):
+        try:
+            rq = r.request
+            if rq.resource_type in ("xhr", "fetch") or rq.method == "POST":
+                lst = NETLOG.get(page)
+                if lst is not None:
+                    lst.append(r)
+                    del lst[:-60]
+        except Exception:
+            pass
+
+    page.on("response", _resp)
+    page.on("close", lambda *_: (DIALOGS.pop(page, None), STEPS.pop(page, None), PROGRESS.pop(page, None), NETLOG.pop(page, None), NETMARK.pop(page, None), NETSEEN.pop(page, None)))
     return ctx, page
 
 
@@ -519,13 +545,39 @@ def watched_msgs(page):
     return out
 
 
-def wait_outcome(page, c, base_ok=None, base_bad=None, dstart=0, allow_login=False, timeout=None, confirm=False):
+def net_mark(page):
+    NETMARK[page] = len(NETLOG.get(page, []))
+    NETSEEN[page] = set()
+
+
+def net_answers(page):
+    """Responses of the server since the action started -> list of (status, body_text). Bodies are read once."""
+    out = []
+    lst = NETLOG.get(page, [])
+    start = NETMARK.get(page)
+    if start is None:
+        return out
+    seen = NETSEEN.setdefault(page, set())
+    for r in list(lst[start:]) if start <= len(lst) else list(lst):
+        try:
+            if id(r) in seen:
+                continue
+            body = r.text()[:400]
+            seen.add(id(r))
+            out.append((r.status, body))
+        except Exception:
+            continue
+    return out
+
+
+def wait_outcome(page, c, base_ok=None, base_bad=None, dstart=0, allow_login=False, timeout=None, confirm=False, soft_ok=False):
     """Wait for the application to answer: ('ok'|'bad'|'login'|'none', message)."""
     base_ok, base_bad = base_ok or set(), base_bad or set()
     ok_re, bad_re = re.compile(c["success_regex"], re.I), re.compile(c["failure_regex"], re.I)
     t0 = time.time()
     end = t0 + (timeout or c["outcome_timeout_s"])
     confirms = 0
+    first_soft = 0
     while time.time() < end:
         try:
             for m in DIALOGS.get(page, [])[dstart:]:
@@ -538,6 +590,15 @@ def wait_outcome(page, c, base_ok=None, base_bad=None, dstart=0, allow_login=Fal
                     return ("bad", m[:160])
                 if ok_re.search(m):
                     return ("ok", m[:160])
+            for st, body in net_answers(page):
+                NETSOFT.setdefault(page, []).append((st, body))
+                if len(body) < 250 and ok_re.search(body) and not bad_re.search(body):  # short action reply that says success
+                    return ("ok", re.sub(r"\s+", " ", body)[:160])
+            if soft_ok and NETSOFT.get(page) and any(200 <= x[0] < 300 for x in NETSOFT[page]):
+                first_soft = first_soft or time.time()
+                if time.time() - first_soft > 10:  # the server accepted the request and nothing else appeared on screen
+                    NETSOFT.pop(page, None)
+                    return ("ok", "the application's server accepted the request (no on-screen message was shown)")
             new_ok = matching_texts(page, c["success_regex"]) - base_ok
             if new_ok:
                 return ("ok", sorted(new_ok)[0])
@@ -555,6 +616,10 @@ def wait_outcome(page, c, base_ok=None, base_bad=None, dstart=0, allow_login=Fal
         except Exception:
             pass
         time.sleep(0.4)
+    soft = [x for x in NETSOFT.pop(page, []) if 200 <= x[0] < 300]
+    if soft and soft_ok:
+        return ("ok", "the application's server accepted the request (no on-screen message was shown)")
+    NETSOFT.pop(page, None)
     return ("none", "")
 
 
@@ -912,6 +977,7 @@ def user_reset_one(browser, url, uid, old, new, on_stage=None):
         base_ok, base_bad = matching_texts(page, c["success_regex"]), matching_texts(page, c["failure_regex"])
         base_toast = toast_set(page)
         base_lines = page_lines(page)
+        net_mark(page)
         dstart = len(DIALOGS.get(page, []))
         watch_start(page, c)
         step(page, uid + ": click Save")
@@ -1137,6 +1203,7 @@ def _l2_action(page, c, uid, label_key, radio_key, wait_msg):
     base_ok, base_bad = matching_texts(page, c["success_regex"]), matching_texts(page, c["failure_regex"])
     dstart = len(DIALOGS.get(page, []))
     watch_start(page, c)
+    net_mark(page)
     return base_ok, base_bad, dstart
 
 
@@ -1167,7 +1234,7 @@ def l2_unlock(page, c, uid, required=True):
     step(page, f"click '{c['l2_unlock_link']}' for {uid}")
     l2_click_action(fr)
     step(page, "wait for the unlock confirmation")
-    kind, txt = wait_outcome(page, c, base_ok, base_bad, dstart, confirm=True, timeout=c["outcome_timeout_s"])
+    kind, txt = wait_outcome(page, c, base_ok, base_bad, dstart, confirm=True, timeout=c.get("l2_outcome_timeout_s", 90), soft_ok=True)
     if kind == "ok":
         time.sleep(2.0)
         return True
@@ -1195,7 +1262,7 @@ def l2_reset(page, c, uid):
     step(page, f"click '{c['l2_reset_link']}' for {uid}")
     l2_click_action(fr)
     step(page, "wait for the reset confirmation")
-    kind, txt = wait_outcome(page, c, base_ok, base_bad, dstart, confirm=True, timeout=c["outcome_timeout_s"])
+    kind, txt = wait_outcome(page, c, base_ok, base_bad, dstart, confirm=True, timeout=c.get("l2_outcome_timeout_s", 90), soft_ok=True)
     if kind == "ok":
         time.sleep(2.0)
         return

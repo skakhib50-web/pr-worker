@@ -1,8 +1,9 @@
 {
-  "_version": 6,
+  "_version": 7,
   "nav_timeout_ms": 60000,
   "step_timeout_ms": 20000,
   "outcome_timeout_s": 20,
+  "l2_outcome_timeout_s": 90,
   "login_user": "#UserName, input[name='UserName'], input[id*='user' i], input[placeholder*='user' i], input[type='text']",
   "login_pass": "#Password, input[type='password']",
   "login_btn": "#Login, button[type='submit'], button:has-text('Login'), button:has-text('Log in'), button:has-text('Sign in'), input[type='submit']",

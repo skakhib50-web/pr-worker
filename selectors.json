@@ -14,7 +14,7 @@
   "reset_confirm": "",
   "save_btn": "button:has-text('Save'), input[value='Save'], input[type='button'][value*='Save' i], a:has-text('Save')",
   "success_regex": "success|has been (changed|updated|reset)|password (changed|updated|reset)|reset done|unlocked",
-  "failure_regex": "invalid|incorrect|failed|not match|cannot|can't|already used|previous password|policy|error|must contain|at least",
+  "failure_regex": "invalid|incorrect|failed|not match|do(es)? ?n.t match|cannot|can.t|already used|previous password|policy|error|must contain|must be|at least|same as|should (not|contain|be)|required|not allowed|wrong",
   "confirm_btn": "button:has-text('Yes'), button:has-text('OK'), button:has-text('Confirm')",
   "logout_btn": "text=/log ?out|sign ?out/i",
   "l2_menu": "Reset Password",

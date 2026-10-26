@@ -46,6 +46,7 @@ IGNORE_SSL = os.environ.get("IGNORE_SSL", "0") == "1"
 SAVE_SHOTS = os.environ.get("SAVE_SHOTS", "1") == "1"
 MAX_BROWSERS = int(os.environ.get("MAX_BROWSERS", "1"))
 POLL = float(os.environ.get("POLL_SECONDS", "2"))
+VERSION = "8"
 IDLE_EXIT = float(os.environ.get("IDLE_EXIT_SECONDS", "0"))   # >0: exit when no job for this long (used by the GitHub Actions runner)
 WORKER_ID = os.environ.get("WORKER_ID") or uuid.uuid4().hex[:8]
 CFG_PATH = BASE / "selectors.json"
@@ -451,6 +452,18 @@ def login_page_visible(page):
         return False
 
 
+def login_screen_now(page, c):
+    """True only when we are really back on the LOGIN screen (not merely on a page that shows password boxes, like Change Password)."""
+    try:
+        if re.search(r"/login", page.url or "", re.I):
+            return True
+        if find_form_frame(page, c):
+            return False
+        return bool(page.evaluate("() => { const u = document.querySelector('#UserName'); const p = document.querySelector('input[type=password]'); return !!u && u.offsetParent !== null && !!p && p.offsetParent !== null && !!document.querySelector('#Login'); }"))
+    except Exception:
+        return False
+
+
 def visible_text_el(page, regex):
     for fr in list(page.frames):
         try:
@@ -531,7 +544,7 @@ def wait_outcome(page, c, base_ok=None, base_bad=None, dstart=0, allow_login=Fal
             new_bad = matching_texts(page, c["failure_regex"]) - base_bad
             if new_bad:
                 return ("bad", sorted(new_bad)[0])
-            if allow_login and login_page_visible(page):
+            if allow_login and time.time() - t0 > 1.0 and login_screen_now(page, c):
                 return ("login", "")
             if confirm and confirms < 3 and time.time() - t0 > 0.7:
                 for fr in list(page.frames):
@@ -725,18 +738,87 @@ def fill_reset_form(page, c, frame, items, old, new):
     log("fields -> existing: {} | new: {} | confirm: {}".format(
         *[(f"{x.get('id') or x.get('name') or '?'}/{x.get('label') or '-'}" if x else "none") for x in (o, n, cf)]))
     loc = frame.locator("input, textarea")
-    for it, val in ((o, old), (n, new), (cf, new)):
+    for role, it, val in (("Existing", o, old), ("New", n, new), ("Confirm", cf, new)):
         if it is None:
             continue
+        el = loc.nth(it["i"])
+        ok = False
+        for attempt in range(3):
+            try:
+                el.scroll_into_view_if_needed(timeout=2000)
+            except Exception:
+                pass
+            try:
+                el.click(timeout=3000)
+            except Exception:
+                try:
+                    el.focus(timeout=2000)
+                except Exception:
+                    pass
+            try:
+                if attempt == 0:
+                    safe_fill(el, val)
+                elif attempt == 1:
+                    el.press("Control+A")
+                    el.press("Delete")
+                    _type_slow(el, val)
+                else:  # native setter - works with frameworks that ignore .value assignments
+                    el.evaluate("(e,v)=>{const d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');d.set.call(e,v);}", val)
+                for ev in ("input", "keyup", "change"):
+                    el.dispatch_event(ev)
+                got = el.input_value(timeout=2000)
+            except Exception:
+                got = None
+            if got == val:
+                ok = True
+                break
+            time.sleep(0.3)
         try:
-            el = loc.nth(it["i"])
-            el.focus(timeout=3000)
-            safe_fill(el, val)
-            for ev in ("input", "keyup", "change"):
-                el.dispatch_event(ev)
             el.evaluate("e => e.blur()")
         except Exception:
             pass
+        if not ok:
+            raise StepError(f"Could not type the {role} Password into the form (field did not accept the text)")
+
+
+def form_state(frame):
+    """Redacted description of the Change Password form: which fields are filled + visible validation text."""
+    try:
+        return frame.evaluate(r"""() => { const f = Array.from(document.querySelectorAll('input[type=password]')).filter(e => e.offsetParent !== null);
+          const bad = Array.from(document.querySelectorAll('[class*=error i],[class*=invalid i],[class*=valid i],[role=alert],[class*=toast i],[class*=alert i],.help-block,small,label.active'))
+            .filter(e => e.offsetParent !== null && /require|invalid|match|must|enter|same|least|special|upper|lower|digit|policy|old|new|wrong/i.test(e.textContent||''))
+            .map(e => (e.textContent||'').trim().replace(/\s+/g,' ').slice(0,90)).filter(Boolean);
+          return {n: f.length, filled: f.map(e => e.value.length > 0), msgs: Array.from(new Set(bad)).slice(0,3)}; }""")
+    except Exception:
+        return None
+
+
+JS_TOASTS = r"""() => Array.from(document.querySelectorAll('[class*=toast i],[class*=snack i],[class*=notif i],[class*=alert i],[role=alert],[class*=noty i],[class*=growl i],[class*=message i],[class*=pnotify i]'))
+  .filter(e => e.offsetParent !== null || getComputedStyle(e).position === 'fixed')
+  .map(e => (e.innerText||'').trim().replace(/\s+/g,' ').slice(0,140)).filter(t => t && t.length < 140)"""
+
+
+JS_LINES = r"""() => (document.body ? document.body.innerText : '').split(/\n+/).map(t => t.trim().replace(/\s+/g,' ')).filter(t => t && t.length < 160)"""
+
+
+def page_lines(page):
+    out = set()
+    for fr in list(page.frames):
+        try:
+            out |= set(fr.evaluate(JS_LINES))
+        except Exception:
+            pass
+    return out
+
+
+def toast_set(page):
+    out = set()
+    for fr in list(page.frames):
+        try:
+            out |= set(fr.evaluate(JS_TOASTS))
+        except Exception:
+            pass
+    return out
 
 
 def click_save(page, frame, c):
@@ -828,19 +910,31 @@ def user_reset_one(browser, url, uid, old, new, on_stage=None):
         step(page, uid + ": fill Existing/New/Confirm")
         fill_reset_form(page, c, frame, items, old, new)
         base_ok, base_bad = matching_texts(page, c["success_regex"]), matching_texts(page, c["failure_regex"])
+        base_toast = toast_set(page)
+        base_lines = page_lines(page)
         dstart = len(DIALOGS.get(page, []))
         watch_start(page, c)
         step(page, uid + ": click Save")
         if not click_save(page, frame, c):
             raise StepError("Save button not found")
         step(page, uid + ": wait for confirmation")
-        kind, txt = wait_outcome(page, c, base_ok, base_bad, dstart, allow_login=True, confirm=True)
+        kind, txt = wait_outcome(page, c, base_ok, base_bad, dstart, allow_login=True, confirm=True, timeout=10)
+        if kind == "none":  # nothing yet: if the form is still there with the values in it, press Save once more
+            st = form_state(frame)
+            if st and st.get("n", 0) >= 3 and all(st.get("filled", [])):
+                step(page, uid + ": no answer yet - click Save again")
+                click_save(page, frame, c)
+                kind, txt = wait_outcome(page, c, base_ok, base_bad, dstart, allow_login=True, confirm=True, timeout=10)
         if kind == "ok":
             stage(page, "logout")
             try_logout(page, c, uid)
             return res(True, ["Password reset done."], "via " + scenario)
         if kind == "bad":
             raise StepError("Application message: " + txt)
+        app_msgs = sorted(toast_set(page) - base_toast)
+        if not app_msgs:  # any new line of text that appeared on screen after Save
+            app_msgs = [t for t in sorted(page_lines(page) - base_lines) if not re.fullmatch(r"[\d\W]+", t)][:3]
+        st = form_state(frame) if kind == "none" else None
         step(page, uid + ": verify by signing in with the new password")
         page.context.clear_cookies()
         if app_login(page, c, url, uid, new) == "home":
@@ -848,7 +942,20 @@ def user_reset_one(browser, url, uid, old, new, on_stage=None):
             stage(page, "logout")
             try_logout(page, c, uid)
             return res(True, ["Password reset done."], "via " + scenario + "; confirmed by signing in with the new password")
-        raise StepError("No confirmation from the application and signing in with the new password failed")
+        why = ""
+        if app_msgs:
+            why = " Application said: " + " | ".join(app_msgs)[:200] + "."
+        elif st and st.get("msgs"):
+            why = " Screen showed: " + " | ".join(st["msgs"])[:200] + "."
+        try:
+            page.context.clear_cookies()
+            still_old = app_login(page, c, url, uid, old) == "home"
+        except Exception:
+            still_old = False
+        if still_old:
+            try_logout(page, c, uid)
+            raise StepError("Password was NOT changed - the old password still works." + why + " Check that the new password meets the application's rules.")
+        raise StepError("Could not confirm the change - neither the old nor the new password signs in." + why)
 
     try:
         return _guard(work, page, "user_" + uid, old, new)
@@ -1277,7 +1384,7 @@ def main():
     try:
         API.call("ping")
         try:
-            API.call("diag", msg="Worker started on the runner - looking for the run")
+            API.call("diag", msg="Worker v" + VERSION + " started on the runner - looking for the run")
         except Exception:
             pass
         print("Connected to the portal - the portal now shows 'Worker online'. Keep this window open.")
